@@ -386,7 +386,12 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
 
 int main(int argc, char *argv[]) {
     QCoreApplication app(argc, argv);
-    app.setApplicationName("JT9DECODE");
+    
+    // Create unique application name for this instance (for shared memory key)
+    QString unique_app_name = QString("JT9DECODE_%1_%2")
+        .arg(QCoreApplication::applicationPid())
+        .arg(QDateTime::currentMSecsSinceEpoch());
+    app.setApplicationName(unique_app_name);
     
     // Parse command-line arguments
     QString wav_file;
