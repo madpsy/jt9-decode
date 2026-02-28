@@ -177,9 +177,22 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
     _setmode(_fileno(stdin), _O_BINARY);
     #endif
     
+    // Get current UTC time in milliseconds
+    auto get_utc_ms = []() -> qint64 {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+    };
+    
+    // Calculate which UTC cycle we're in
+    auto get_utc_cycle = [&mode, &get_utc_ms]() -> qint64 {
+        return get_utc_ms() / mode.cycle_ms;
+    };
+    
     // Track timing and decode state
     qint64 last_decoded_cycle = -1;
     qint64 total_samples_read = 0;
+    qint64 stream_start_time_ms = get_utc_ms();
     
     qStdErr << "Waiting for audio data...\n";
     qStdErr.flush();
@@ -204,19 +217,21 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
             continue;
         }
         
-        // Copy samples to circular buffer and check for cycle boundary
+        // Copy samples to circular buffer and check for UTC cycle boundary
         for (size_t i = 0; i < samples_read; i++) {
             circ_buffer[write_pos] = sample_buf[i];
             write_pos = (write_pos + 1) % BUFFER_SIZE;
             total_samples_read++;
             
-            // Calculate which cycle we're in based on sample count
-            // Assume samples arrive in real-time at 12kHz
-            qint64 current_cycle = total_samples_read / SAMPLES_PER_CYCLE;
+            // Check if we've crossed into a new UTC cycle
+            qint64 current_utc_cycle = get_utc_cycle();
             
-            // Trigger decode when we complete a cycle
-            if (current_cycle != last_decoded_cycle && total_samples_read >= SAMPLES_PER_CYCLE) {
-                last_decoded_cycle = current_cycle;
+            // Trigger decode when:
+            // 1. We've entered a new UTC cycle
+            // 2. We have at least one full cycle of samples
+            // 3. We haven't already decoded this cycle
+            if (current_utc_cycle != last_decoded_cycle && total_samples_read >= SAMPLES_PER_CYCLE) {
+                last_decoded_cycle = current_utc_cycle;
                 
                 // Copy the last SAMPLES_PER_CYCLE samples from circular buffer to decode buffer
                 // The most recent sample is at (write_pos - 1), we need to go back SAMPLES_PER_CYCLE samples
@@ -237,8 +252,14 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
                 struct tm *tm_info = gmtime(&now);
                 int nutc = tm_info->tm_hour * 100 + tm_info->tm_min;
                 
+                // Calculate milliseconds within the minute for more precise logging
+                qint64 utc_ms = get_utc_ms();
+                qint64 ms_in_minute = utc_ms % 60000;
+                double seconds_in_minute = ms_in_minute / 1000.0;
+                
                 qStdErr << "Triggering decode at " << QString("%1").arg(nutc, 4, 10, QChar('0'))
-                        << " (cycle " << current_cycle << ", " << SAMPLES_PER_CYCLE << " samples)\n";
+                        << " +" << QString::number(seconds_in_minute, 'f', 3) << "s"
+                        << " (UTC cycle " << current_utc_cycle << ", " << SAMPLES_PER_CYCLE << " samples)\n";
                 qStdErr.flush();
                 
                 // Update parameters
