@@ -156,7 +156,7 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
                        const ModeConfig &mode) {
     
     const int SAMPLES_PER_CYCLE = (RX_SAMPLE_RATE * mode.cycle_ms) / 1000;
-    const int BUFFER_SIZE = NTMAX * RX_SAMPLE_RATE;  // Total buffer size
+    const int BUFFER_SIZE = NTMAX * RX_SAMPLE_RATE;  // Total buffer size (60 seconds at 12kHz)
     const double CYCLE_SECONDS = mode.cycle_ms / 1000.0;
     
     qStdErr << "Stream mode: Reading 12kHz 16-bit mono PCM from stdin\n";
@@ -164,9 +164,12 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
     qStdErr << "Triggering decodes at UTC-aligned " << CYCLE_SECONDS << " second boundaries\n";
     qStdErr.flush();
     
-    // Circular buffer for audio samples
-    short *audio_buffer = dec_data->d2;
-    int buffer_pos = 0;
+    // Circular buffer for incoming audio
+    short *circ_buffer = new short[BUFFER_SIZE];
+    int write_pos = 0;
+    
+    // Decode buffer (in shared memory)
+    short *decode_buffer = dec_data->d2;
     
     // Open stdin in binary mode
     FILE *stdin_file = stdin;
@@ -174,9 +177,9 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
     _setmode(_fileno(stdin), _O_BINARY);
     #endif
     
-    // Track decode state
+    // Track timing and decode state
+    qint64 last_decoded_cycle = -1;
     qint64 total_samples_read = 0;
-    bool decode_triggered_this_cycle = false;
     
     qStdErr << "Waiting for audio data...\n";
     qStdErr.flush();
@@ -201,23 +204,33 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
             continue;
         }
         
-        // Copy samples to circular buffer
+        // Copy samples to circular buffer and check for cycle boundary
         for (size_t i = 0; i < samples_read; i++) {
-            audio_buffer[buffer_pos] = sample_buf[i];
-            buffer_pos = (buffer_pos + 1) % BUFFER_SIZE;
+            circ_buffer[write_pos] = sample_buf[i];
+            write_pos = (write_pos + 1) % BUFFER_SIZE;
             total_samples_read++;
             
-            // Check if we should trigger a decode based on UTC time
-            // Similar to WSJT-X: trigger when m_tRemaining < 0.35
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            double current_utc_sec = ts.tv_sec + ts.tv_nsec / 1e9;
-            double time_in_period = fmod(current_utc_sec, CYCLE_SECONDS);
-            double time_remaining = CYCLE_SECONDS - time_in_period;
+            // Calculate which cycle we're in based on sample count
+            // Assume samples arrive in real-time at 12kHz
+            qint64 current_cycle = total_samples_read / SAMPLES_PER_CYCLE;
             
-            // Trigger decode when we're near the end of a period and haven't decoded this cycle yet
-            if (time_remaining < 0.5 && !decode_triggered_this_cycle && total_samples_read >= SAMPLES_PER_CYCLE) {
-                decode_triggered_this_cycle = true;
+            // Trigger decode when we complete a cycle
+            if (current_cycle != last_decoded_cycle && total_samples_read >= SAMPLES_PER_CYCLE) {
+                last_decoded_cycle = current_cycle;
+                
+                // Copy the last SAMPLES_PER_CYCLE samples from circular buffer to decode buffer
+                // The most recent sample is at (write_pos - 1), we need to go back SAMPLES_PER_CYCLE samples
+                int read_start = (write_pos - SAMPLES_PER_CYCLE + BUFFER_SIZE) % BUFFER_SIZE;
+                
+                if (read_start + SAMPLES_PER_CYCLE <= BUFFER_SIZE) {
+                    // Contiguous block - simple copy
+                    memcpy(decode_buffer, circ_buffer + read_start, SAMPLES_PER_CYCLE * sizeof(short));
+                } else {
+                    // Wraps around - copy in two parts
+                    int first_part = BUFFER_SIZE - read_start;
+                    memcpy(decode_buffer, circ_buffer + read_start, first_part * sizeof(short));
+                    memcpy(decode_buffer + first_part, circ_buffer, (SAMPLES_PER_CYCLE - first_part) * sizeof(short));
+                }
                 
                 // Get current UTC time
                 time_t now = time(NULL);
@@ -225,7 +238,7 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
                 int nutc = tm_info->tm_hour * 100 + tm_info->tm_min;
                 
                 qStdErr << "Triggering decode at " << QString("%1").arg(nutc, 4, 10, QChar('0'))
-                        << " (" << SAMPLES_PER_CYCLE << " samples)\n";
+                        << " (cycle " << current_cycle << ", " << SAMPLES_PER_CYCLE << " samples)\n";
                 qStdErr.flush();
                 
                 // Update parameters
@@ -290,13 +303,11 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
                 dec_data->ipc[2] = 1;  // acknowledge
                 sharedMemory.unlock();
             }
-            
-            // Reset flag when we enter a new cycle (time_remaining is large again)
-            if (time_remaining > CYCLE_SECONDS - 0.5) {
-                decode_triggered_this_cycle = false;
-            }
         }
     }
+    
+    // Cleanup
+    delete[] circ_buffer;
     
     // Terminate jt9
     qStdErr << "Terminating jt9...\n";
