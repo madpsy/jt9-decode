@@ -1,0 +1,25 @@
+# Compiled binary
+jt9_decode
+
+# Object files
+*.o
+*.obj
+
+# Qt generated files
+*.moc
+moc_*.cpp
+
+# Build directories
+build/
+cmake-build-*/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
