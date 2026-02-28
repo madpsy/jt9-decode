@@ -22,6 +22,8 @@
 #include <QTextStream>
 #include <QMutex>
 #include <QWaitCondition>
+#include <QDir>
+#include <QDateTime>
 #include <cstring>
 #include <ctime>
 #include <cmath>
@@ -533,6 +535,19 @@ int main(int argc, char *argv[]) {
     
     sharedMemory.unlock();
     
+    // Create unique temporary directory in /dev/shm for this instance
+    QString temp_dir_path = QString("/dev/shm/jt9_decode_%1_%2")
+        .arg(QCoreApplication::applicationPid())
+        .arg(QDateTime::currentMSecsSinceEpoch());
+    
+    QDir temp_dir;
+    if (!temp_dir.mkpath(temp_dir_path)) {
+        qStdErr << "Warning: Could not create temp directory in /dev/shm, falling back to /tmp\n";
+        temp_dir_path = "/tmp";
+    } else {
+        qStdErr << "Created temp directory: " << temp_dir_path << "\n";
+    }
+    
     // Start jt9 process
     qStdErr << "Starting jt9 decoder...\n";
     qStdErr.flush();
@@ -544,7 +559,7 @@ int main(int argc, char *argv[]) {
          << "-m" << "1"
          << "-e" << "."
          << "-a" << "."
-         << "-t" << "/tmp";
+         << "-t" << temp_dir_path;
     
     // Verify jt9 binary exists
     if (!QFile::exists(jt9_path)) {
@@ -653,6 +668,18 @@ int main(int argc, char *argv[]) {
         
         qStdErr << "jt9 finished with exit code: " << jt9.exitCode() << "\n";
         qStdErr.flush();
+    }
+    
+    // Cleanup temp directory if we created one in /dev/shm
+    if (temp_dir_path.startsWith("/dev/shm/jt9_decode_")) {
+        QDir temp_dir(temp_dir_path);
+        if (temp_dir.exists()) {
+            if (temp_dir.removeRecursively()) {
+                qStdErr << "Cleaned up temp directory: " << temp_dir_path << "\n";
+            } else {
+                qStdErr << "Warning: Could not remove temp directory: " << temp_dir_path << "\n";
+            }
+        }
     }
     
     return result;
