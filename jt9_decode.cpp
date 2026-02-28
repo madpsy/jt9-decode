@@ -320,6 +320,7 @@ int main(int argc, char *argv[]) {
     int freq_high = 5000;        // High frequency Hz
     QString jt9_path;
     bool stream_mode = false;    // Stream PCM from stdin
+    bool multithread = false;    // Multithreaded FT8 decoding
     QString mode_str = "FT2";    // Default mode
     const ModeConfig *mode = &MODE_FT2;  // Default to FT2
     
@@ -347,6 +348,8 @@ int main(int argc, char *argv[]) {
             }
         } else if (arg == "-s") {
             stream_mode = true;
+        } else if (arg == "-t" || arg == "--multithread") {
+            multithread = true;
         } else if (arg == "--help" || arg == "-help") {
             qStdErr << "Usage: " << argv[0] << " -j <jt9_path> [options] [<wav_file>|-s]\n";
             qStdErr << "\n";
@@ -363,6 +366,8 @@ int main(int argc, char *argv[]) {
             qStdErr << "  -d <depth>    Decoding depth 1-3 (default: 3)\n";
             qStdErr << "  -s            Stream mode: read 12kHz 16-bit mono PCM from stdin\n";
             qStdErr << "                Triggers decodes at cycle boundaries aligned to UTC\n";
+            qStdErr << "  -t, --multithread  Enable multithreaded FT8 decoding (FT8 only)\n";
+            qStdErr << "                     Uses multiple CPU cores for faster decoding\n";
             qStdErr << "  --help        Show this help message\n";
             qStdErr << "\n";
             qStdErr << "Examples:\n";
@@ -448,6 +453,7 @@ int main(int argc, char *argv[]) {
     dec_data->params.lapcqonly = false;
     dec_data->params.nsubmode = 0;
     dec_data->params.ndiskdat = !stream_mode;  // true for WAV files, false for streaming
+    dec_data->params.lmultift8 = multithread;  // Enable multithreaded FT8 (FT8 only)
     
     strncpy(dec_data->params.mycall, "K1ABC", 12);
     strncpy(dec_data->params.mygrid, "FN20", 6);
@@ -492,6 +498,9 @@ int main(int argc, char *argv[]) {
     qStdErr << "  Cycle time: " << (mode->cycle_ms / 1000.0) << " seconds\n";
     qStdErr << "  Depth: " << depth << "\n";
     qStdErr << "  Frequency range: " << freq_low << " - " << freq_high << " Hz\n";
+    if (multithread && mode->mode_code == 8) {
+        qStdErr << "  Multithreaded: enabled (FT8)\n";
+    }
     qStdErr.flush();
     
     int result = 0;
