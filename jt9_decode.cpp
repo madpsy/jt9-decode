@@ -22,6 +22,7 @@
 #include <QTextStream>
 #include <cstring>
 #include <ctime>
+#include <cmath>
 
 extern "C" {
 #include "commons.h"
@@ -156,10 +157,11 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
     
     const int SAMPLES_PER_CYCLE = (RX_SAMPLE_RATE * mode.cycle_ms) / 1000;
     const int BUFFER_SIZE = NTMAX * RX_SAMPLE_RATE;  // Total buffer size
+    const double CYCLE_SECONDS = mode.cycle_ms / 1000.0;
     
     qStdErr << "Stream mode: Reading 12kHz 16-bit mono PCM from stdin\n";
     qStdErr << mode.name << " cycle time: " << mode.cycle_ms << " ms (" << SAMPLES_PER_CYCLE << " samples)\n";
-    qStdErr << "Triggering decodes every " << (mode.cycle_ms / 1000.0) << " seconds aligned to UTC\n";
+    qStdErr << "Triggering decodes at UTC-aligned " << CYCLE_SECONDS << " second boundaries\n";
     qStdErr.flush();
     
     // Circular buffer for audio samples
@@ -172,23 +174,15 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
     _setmode(_fileno(stdin), _O_BINARY);
     #endif
     
-    // Wait for next cycle boundary
-    auto wait_for_next_cycle = [&mode]() -> qint64 {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        qint64 now_ms = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-        qint64 cycle_ms = now_ms % mode.cycle_ms;
-        qint64 wait_ms = mode.cycle_ms - cycle_ms;
-        return wait_ms;
-    };
-    
-    // Read samples continuously
-    short sample_buf[4096];
-    bool first_decode = true;
-    qint64 samples_since_decode = 0;
+    // Track decode state
+    qint64 total_samples_read = 0;
+    bool decode_triggered_this_cycle = false;
     
     qStdErr << "Waiting for audio data...\n";
     qStdErr.flush();
+    
+    // Read samples continuously
+    short sample_buf[4096];
     
     while (true) {
         // Read samples from stdin
@@ -211,18 +205,19 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
         for (size_t i = 0; i < samples_read; i++) {
             audio_buffer[buffer_pos] = sample_buf[i];
             buffer_pos = (buffer_pos + 1) % BUFFER_SIZE;
-            samples_since_decode++;
+            total_samples_read++;
             
-            // Check if we've accumulated enough samples for a decode cycle
-            if (samples_since_decode >= SAMPLES_PER_CYCLE) {
-                // Wait for cycle boundary if this is not the first decode
-                if (!first_decode) {
-                    qint64 wait_ms = wait_for_next_cycle();
-                    if (wait_ms > 0 && wait_ms < mode.cycle_ms) {
-                        QThread::msleep(wait_ms);
-                    }
-                }
-                first_decode = false;
+            // Check if we should trigger a decode based on UTC time
+            // Similar to WSJT-X: trigger when m_tRemaining < 0.35
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            double current_utc_sec = ts.tv_sec + ts.tv_nsec / 1e9;
+            double time_in_period = fmod(current_utc_sec, CYCLE_SECONDS);
+            double time_remaining = CYCLE_SECONDS - time_in_period;
+            
+            // Trigger decode when we're near the end of a period and haven't decoded this cycle yet
+            if (time_remaining < 0.5 && !decode_triggered_this_cycle && total_samples_read >= SAMPLES_PER_CYCLE) {
+                decode_triggered_this_cycle = true;
                 
                 // Get current UTC time
                 time_t now = time(NULL);
@@ -230,13 +225,13 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
                 int nutc = tm_info->tm_hour * 100 + tm_info->tm_min;
                 
                 qStdErr << "Triggering decode at " << QString("%1").arg(nutc, 4, 10, QChar('0'))
-                        << " (" << samples_since_decode << " samples)\n";
+                        << " (" << SAMPLES_PER_CYCLE << " samples)\n";
                 qStdErr.flush();
                 
                 // Update parameters
                 sharedMemory.lock();
                 dec_data->params.nutc = nutc;
-                dec_data->params.kin = samples_since_decode;
+                dec_data->params.kin = SAMPLES_PER_CYCLE;
                 dec_data->params.newdat = true;
                 
                 // Trigger decode
@@ -294,8 +289,11 @@ int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int fre
                 sharedMemory.lock();
                 dec_data->ipc[2] = 1;  // acknowledge
                 sharedMemory.unlock();
-                
-                samples_since_decode = 0;
+            }
+            
+            // Reset flag when we enter a new cycle (time_remaining is large again)
+            if (time_remaining > CYCLE_SECONDS - 0.5) {
+                decode_triggered_this_cycle = false;
             }
         }
     }
