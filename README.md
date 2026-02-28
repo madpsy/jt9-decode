@@ -7,6 +7,7 @@ A standalone command-line wrapper for the WSJT-X jt9 decoder engine, supporting 
 - **Multi-mode support**: FT2, FT4, and FT8
 - Decode signals from WAV files or continuous audio streams
 - **Stream mode**: Continuously decode from stdin (PCM audio stream)
+- **Multithreaded FT8 decoding**: Use multiple CPU cores for faster FT8 decoding
 - Configurable decoding depth (1-3)
 - Clean output separation (decoded messages to stdout, diagnostics to stderr)
 - Handles WAV files with metadata chunks
@@ -73,6 +74,10 @@ g++ -o jt9_decode jt9_decode.cpp -I/usr/include/x86_64-linux-gnu/qt5 \
   - Continuously processes audio
   - Triggers decodes at cycle boundaries aligned to UTC
   - Keeps jt9 running for efficiency
+- `-t, --multithread` - Enable multithreaded FT8 decoding (FT8 only)
+  - Uses multiple CPU cores for faster decoding
+  - Can decode more simultaneous signals
+  - Provides better performance on busy bands
 - `--help` - Show help message
 
 ## Examples
