@@ -385,25 +385,7 @@ private slots:
         }
         buffer_mutex.unlock();
 
-        // DIAGNOSTIC: Check what's in the audio buffer
-        double sum = 0.0;
-        int check_samples = (SAMPLES_PER_CYCLE < 180000) ? SAMPLES_PER_CYCLE : 180000;
-        short min_val = 32767, max_val = -32768;
-        for (int i = 0; i < check_samples; i++) {
-            sum += (double)dec_data->d2[i] * (double)dec_data->d2[i];
-            if (dec_data->d2[i] < min_val) min_val = dec_data->d2[i];
-            if (dec_data->d2[i] > max_val) max_val = dec_data->d2[i];
-        }
-        double rms = sqrt(sum / check_samples);
-        
-        qStdErr << "AUDIO CHECK: RMS=" << QString::number(rms, 'f', 2)
-                << " (jt9 needs >=0.5), min=" << min_val << ", max=" << max_val << "\n";
-        qStdErr << "First 20 samples: ";
-        for (int i = 0; i < 20 && i < SAMPLES_PER_CYCLE; i++) qStdErr << dec_data->d2[i] << " ";
-        qStdErr << "\n";
-        qStdErr.flush();
-
-        // THEN lock shared memory to set params and trigger decode atomically
+        // Lock shared memory to set params and trigger decode atomically
         // This matches the original working version's approach
         sharedMemory->lock();
         dec_data->params.nutc = nutc;
@@ -412,12 +394,6 @@ private slots:
         dec_data->ipc[0] = mode.ihsym;
         dec_data->ipc[1] = 1;   // start decode
         dec_data->ipc[2] = -1;  // not done
-        
-        qStdErr << "PARAMS: nutc=" << nutc << ", kin=" << SAMPLES_PER_CYCLE
-                << ", ihsym=" << mode.ihsym << ", nzhsym=" << dec_data->params.nzhsym
-                << ", nmode=" << dec_data->params.nmode << ", ndiskdat=" << dec_data->params.ndiskdat
-                << ", newdat=" << dec_data->params.newdat << ", ntrperiod=" << dec_data->params.ntrperiod << "\n";
-        qStdErr.flush();
         
         sharedMemory->unlock();
         
