@@ -10,6 +10,11 @@
  * Uses Qt's QSharedMemory for IPC with jt9, implementing the same
  * shared memory protocol as WSJT-X.
  *
+ * ARCHITECTURE: Asynchronous event-driven model matching WSJT-X
+ * - Uses Qt signals/slots for jt9 communication
+ * - Non-blocking decode processing
+ * - Proper state management and acknowledgment
+ *
  * Outputs diagnostic messages to stderr, decoded messages to stdout
  */
 
@@ -24,6 +29,8 @@
 #include <QWaitCondition>
 #include <QDir>
 #include <QDateTime>
+#include <QTimer>
+#include <QObject>
 #include <cstring>
 #include <ctime>
 #include <cmath>
@@ -147,13 +154,14 @@ struct ModeConfig {
     int mode_code;      // jt9 mode code
     int cycle_ms;       // cycle time in milliseconds
     int ihsym;          // number of symbols
+    int nzhsym;         // hsymStop - symbols to decode (WSJT-X m_hsymStop)
     const char* name;   // mode name
 };
 
-// Mode configurations
-const ModeConfig MODE_FT2  = {52, 3750, 105, "FT2"};   // 3.75 seconds
-const ModeConfig MODE_FT4  = {5,  7500, 105, "FT4"};   // 7.5 seconds
-const ModeConfig MODE_FT8  = {8,  15000, 50, "FT8"};   // 15 seconds
+// Mode configurations (matching WSJT-X lines 2207, 2211, 2213)
+const ModeConfig MODE_FT2  = {52, 3750, 105, 21, "FT2"};   // 3.75 seconds, hsymStop=21
+const ModeConfig MODE_FT4  = {5,  7500, 105, 21, "FT4"};   // 7.5 seconds, hsymStop=21
+const ModeConfig MODE_FT8  = {8,  15000, 50, 50, "FT8"};   // 15 seconds, hsymStop=50
 
 // Audio reader thread - continuously reads samples from stdin
 class AudioReaderThread : public QThread {
@@ -205,184 +213,286 @@ private:
     std::atomic<bool> should_stop;
 };
 
-// Streaming mode: continuously read PCM from stdin and trigger decodes at cycle boundaries
-int stream_mode_decode(const QString &jt9_path, int depth, int freq_low, int freq_high,
-                       QSharedMemory &sharedMemory, dec_data_t *dec_data, QProcess &jt9,
-                       const ModeConfig &mode) {
+// Forward declaration
+class StreamDecoder;
+
+// Asynchronous stream decoder - matches WSJT-X architecture
+class StreamDecoder : public QObject {
+    Q_OBJECT
     
-    const int SAMPLES_PER_CYCLE = (RX_SAMPLE_RATE * mode.cycle_ms) / 1000;
-    const int BUFFER_SIZE = NTMAX * RX_SAMPLE_RATE;  // Total buffer size (60 seconds at 12kHz)
-    const double CYCLE_SECONDS = mode.cycle_ms / 1000.0;
-    
-    qStdErr << "Stream mode: Reading 12kHz 16-bit mono PCM from stdin\n";
-    qStdErr << mode.name << " cycle time: " << mode.cycle_ms << " ms (" << SAMPLES_PER_CYCLE << " samples)\n";
-    qStdErr << "Triggering decodes at UTC-aligned " << CYCLE_SECONDS << " second boundaries\n";
-    qStdErr.flush();
-    
-    // Circular buffer for incoming audio
-    short *circ_buffer = new short[BUFFER_SIZE];
-    QMutex buffer_mutex;
-    
-    // Decode buffer (in shared memory)
-    short *decode_buffer = dec_data->d2;
-    
-    // Start audio reader thread
-    AudioReaderThread reader_thread(circ_buffer, BUFFER_SIZE, &buffer_mutex);
-    reader_thread.start();
-    
-    // Get current UTC time in milliseconds
-    auto get_utc_ms = []() -> qint64 {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-    };
-    
-    // Calculate milliseconds until next cycle boundary
-    auto ms_to_next_cycle = [&mode, &get_utc_ms]() -> qint64 {
-        qint64 now_ms = get_utc_ms();
-        qint64 ms_in_cycle = now_ms % mode.cycle_ms;
-        return mode.cycle_ms - ms_in_cycle;
-    };
-    
-    qStdErr << "Waiting for first cycle boundary...\n";
-    qStdErr.flush();
-    
-    // Wait for enough samples to accumulate
-    while (reader_thread.getTotalSamples() < SAMPLES_PER_CYCLE) {
-        QThread::msleep(100);
-    }
-    
-    // Wait for the next cycle boundary
-    qint64 wait_ms = ms_to_next_cycle();
-    if (wait_ms > 100) {  // Only wait if more than 100ms away
-        qStdErr << "Waiting " << wait_ms << " ms for cycle boundary...\n";
+public:
+    StreamDecoder(QSharedMemory *shm, dec_data_t *dec, QProcess *jt9_proc,
+                  const ModeConfig &mode_cfg, QObject *parent = nullptr)
+        : QObject(parent), sharedMemory(shm), dec_data(dec), jt9(jt9_proc),
+          mode(mode_cfg), decode_in_progress(false), total_decodes(0),
+          skipped_cycles(0), jt9_decode_count(0)
+    {
+        SAMPLES_PER_CYCLE = (RX_SAMPLE_RATE * mode.cycle_ms) / 1000;
+        BUFFER_SIZE = NTMAX * RX_SAMPLE_RATE;
+        
+        // Allocate circular buffer
+        circ_buffer = new short[BUFFER_SIZE];
+        
+        // Start audio reader thread
+        reader_thread = new AudioReaderThread(circ_buffer, BUFFER_SIZE, &buffer_mutex);
+        reader_thread->start();
+        
+        // Connect jt9 output to our handler (WSJT-X style)
+        connect(jt9, &QProcess::readyReadStandardOutput, this, &StreamDecoder::readFromStdout);
+        
+        // Connect jt9 error/finished signals for health monitoring
+        connect(jt9, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                this, &StreamDecoder::jt9Finished);
+        connect(jt9, &QProcess::errorOccurred, this, &StreamDecoder::jt9Error);
+        
+        // Timer for cycle boundaries
+        cycle_timer = new QTimer(this);
+        connect(cycle_timer, &QTimer::timeout, this, &StreamDecoder::onCycleTimer);
+        
+        qStdErr << "Stream mode: Reading 12kHz 16-bit mono PCM from stdin\n";
+        qStdErr << mode.name << " cycle time: " << mode.cycle_ms << " ms (" << SAMPLES_PER_CYCLE << " samples)\n";
+        qStdErr << "Triggering decodes at UTC-aligned " << (mode.cycle_ms / 1000.0) << " second boundaries\n";
         qStdErr.flush();
-        QThread::msleep(wait_ms);
     }
     
-    qStdErr << "Starting decode loop...\n";
-    qStdErr.flush();
+    ~StreamDecoder() {
+        if (reader_thread) {
+            reader_thread->stop();
+            reader_thread->wait();
+            delete reader_thread;
+        }
+        delete[] circ_buffer;
+    }
     
-    // Main decode loop - triggers at each cycle boundary
-    while (reader_thread.isRunning()) {
-        // Wait for next cycle boundary
-        qint64 wait_ms = ms_to_next_cycle();
-        if (wait_ms > 10) {
+    void start() {
+        qStdErr << "Waiting for first cycle boundary...\n";
+        qStdErr.flush();
+        
+        // Wait for enough samples to accumulate
+        while (reader_thread->getTotalSamples() < SAMPLES_PER_CYCLE) {
+            QThread::msleep(100);
+            QCoreApplication::processEvents();
+        }
+        
+        // Calculate time to next cycle boundary
+        qint64 wait_ms = msToNextCycle();
+        if (wait_ms > 100) {
+            qStdErr << "Waiting " << wait_ms << " ms for cycle boundary...\n";
+            qStdErr.flush();
             QThread::msleep(wait_ms);
         }
         
-        // Check if we have enough samples
-        if (reader_thread.getTotalSamples() < SAMPLES_PER_CYCLE) {
-            QThread::msleep(100);
-            continue;
-        }
-        
-        // Lock buffer and copy samples for decoding
-        buffer_mutex.lock();
-        int write_pos = reader_thread.getWritePos();
-        
-        // Copy the last SAMPLES_PER_CYCLE samples from circular buffer
-        int read_start = (write_pos - SAMPLES_PER_CYCLE + BUFFER_SIZE) % BUFFER_SIZE;
-        
-        if (read_start + SAMPLES_PER_CYCLE <= BUFFER_SIZE) {
-            // Contiguous block
-            memcpy(decode_buffer, circ_buffer + read_start, SAMPLES_PER_CYCLE * sizeof(short));
-        } else {
-            // Wraps around
-            int first_part = BUFFER_SIZE - read_start;
-            memcpy(decode_buffer, circ_buffer + read_start, first_part * sizeof(short));
-            memcpy(decode_buffer + first_part, circ_buffer, (SAMPLES_PER_CYCLE - first_part) * sizeof(short));
-        }
-        buffer_mutex.unlock();
-        
-        // Get current UTC time
-        time_t now = time(NULL);
-        struct tm *tm_info = gmtime(&now);
-        int nutc = tm_info->tm_hour * 100 + tm_info->tm_min;
-        
-        // Calculate precise time for logging
-        qint64 utc_ms = get_utc_ms();
-        qint64 ms_in_minute = utc_ms % 60000;
-        double seconds_in_minute = ms_in_minute / 1000.0;
-        
-        qStdErr << "Triggering decode at " << QString("%1").arg(nutc, 4, 10, QChar('0'))
-                << " +" << QString::number(seconds_in_minute, 'f', 3) << "s"
-                << " (" << SAMPLES_PER_CYCLE << " samples)\n";
+        qStdErr << "Starting decode loop...\n";
         qStdErr.flush();
         
-        // Update parameters and trigger decode
-        sharedMemory.lock();
-        dec_data->params.nutc = nutc;
-        dec_data->params.kin = SAMPLES_PER_CYCLE;
-        dec_data->params.newdat = true;
-        dec_data->ipc[0] = mode.ihsym;
-        dec_data->ipc[1] = 1;  // start decode
-        dec_data->ipc[2] = -1;  // not done
-        sharedMemory.unlock();
+        // Start cycle timer - triggers at each cycle boundary
+        cycle_timer->start(mode.cycle_ms);
         
-        // Read jt9 output (non-blocking)
-        int wait_count = 0;
-        bool decode_started = false;
-        while (wait_count < 100) {  // Max 10 seconds
-            QThread::msleep(100);
+        // Trigger first decode immediately
+        onCycleTimer();
+    }
+    
+private slots:
+    // Called when jt9 has output ready (WSJT-X style: readFromStdout)
+    void readFromStdout() {
+        while (jt9->canReadLine()) {
+            QString line = QString::fromLocal8Bit(jt9->readLine()).trimmed();
             
-            sharedMemory.lock();
-            bool done = (dec_data->ipc[1] == 0);
-            sharedMemory.unlock();
-            
-            if (done) decode_started = true;
-            
-            // Read any available output
-            jt9.waitForReadyRead(10);
-            while (jt9.canReadLine()) {
-                QString line = QString::fromLocal8Bit(jt9.readLine()).trimmed();
-                if (line.length() > 6 && line[0].isDigit() && !line.startsWith('<')) {
-                    qStdOut << line << "\n";
-                    qStdOut.flush();
-                } else if (!line.isEmpty()) {
-                    qStdErr << "jt9: " << line << "\n";
-                    qStdErr.flush();
+            // Check for decode finished marker (matching WSJT-X line 6233)
+            if (line.indexOf("<DecodeFinished>") >= 0) {
+                // Extract decode count from <DecodeFinished> line
+                // Format: "<DecodeFinished>   nsynced  ndecoded  navg"
+                // We want the second number (ndecoded)
+                QStringList parts = line.mid(16).trimmed().split(QRegExp("\\s+"), Qt::SkipEmptyParts);
+                if (parts.size() >= 2) {
+                    jt9_decode_count = parts[1].toInt();
                 }
-            }
-            
-            if (decode_started && wait_count > 5) break;
-            wait_count++;
-        }
-        
-        // Final read
-        jt9.waitForReadyRead(100);
-        while (jt9.canReadLine()) {
-            QString line = QString::fromLocal8Bit(jt9.readLine()).trimmed();
-            if (line.length() > 6 && line[0].isDigit() && !line.startsWith('<')) {
+                decodeDone();  // Call decodeDone like WSJT-X does (line 6244)
+                return;
+            } else if (line.length() > 6 && line[0].isDigit() && !line.startsWith('<')) {
+                // Actual decode line - output to stdout
                 qStdOut << line << "\n";
                 qStdOut.flush();
             } else if (!line.isEmpty()) {
+                // Debug/diagnostic output
                 qStdErr << "jt9: " << line << "\n";
                 qStdErr.flush();
             }
         }
-        
-        // Acknowledge decode
-        sharedMemory.lock();
-        dec_data->ipc[2] = 1;
-        sharedMemory.unlock();
     }
     
-    // Stop reader thread
-    reader_thread.stop();
-    reader_thread.wait();
+    // Called at each cycle boundary
+    void onCycleTimer() {
+        // Check if jt9 is still running
+        if (jt9->state() != QProcess::Running) {
+            qStdErr << "Error: jt9 process is not running!\n";
+            qStdErr.flush();
+            QCoreApplication::quit();
+            return;
+        }
+        
+        // Skip this cycle if previous decode still running (matching WSJT-X behavior)
+        if (decode_in_progress) {
+            skipped_cycles++;
+            qStdErr << "Warning: Previous decode still running, skipping this cycle "
+                    << "(total skipped: " << skipped_cycles << ")\n";
+            qStdErr.flush();
+            return;
+        }
+        
+        // Check if we have enough samples
+        if (reader_thread->getTotalSamples() < SAMPLES_PER_CYCLE) {
+            qStdErr << "Warning: Not enough samples yet (" << reader_thread->getTotalSamples() << " < " << SAMPLES_PER_CYCLE << ")\n";
+            qStdErr.flush();
+            return;
+        }
+        
+        // Mark decode as in progress
+        decode_in_progress = true;
+        decode_start_ms = getUtcMs();
+
+        // Get current UTC time
+        time_t now = time(NULL);
+        struct tm *tm_info = gmtime(&now);
+        int nutc = tm_info->tm_hour * 100 + tm_info->tm_min;
+
+        // Calculate precise time for logging
+        qint64 utc_ms = getUtcMs();
+        qint64 ms_in_minute = utc_ms % 60000;
+        double seconds_in_minute = ms_in_minute / 1000.0;
+
+        total_decodes++;
+        qStdErr << "Triggering decode #" << total_decodes
+                << " at " << QString("%1").arg(nutc, 4, 10, QChar('0'))
+                << " +" << QString::number(seconds_in_minute, 'f', 3) << "s"
+                << " (" << SAMPLES_PER_CYCLE << " samples)\n";
+        qStdErr.flush();
+
+        // Copy audio samples directly to shared memory (matching original working version)
+        // No shared memory lock needed for audio data - only buffer_mutex
+        buffer_mutex.lock();
+        int write_pos = reader_thread->getWritePos();
+        int read_start = (write_pos - SAMPLES_PER_CYCLE + BUFFER_SIZE) % BUFFER_SIZE;
+
+        if (read_start + SAMPLES_PER_CYCLE <= BUFFER_SIZE) {
+            // Contiguous block - copy directly to shared memory
+            memcpy(dec_data->d2, circ_buffer + read_start, SAMPLES_PER_CYCLE * sizeof(short));
+        } else {
+            // Wraps around - copy in two parts directly to shared memory
+            int first_part = BUFFER_SIZE - read_start;
+            memcpy(dec_data->d2, circ_buffer + read_start, first_part * sizeof(short));
+            memcpy(dec_data->d2 + first_part, circ_buffer, (SAMPLES_PER_CYCLE - first_part) * sizeof(short));
+        }
+        buffer_mutex.unlock();
+
+        // DIAGNOSTIC: Check what's in the audio buffer
+        double sum = 0.0;
+        int check_samples = (SAMPLES_PER_CYCLE < 180000) ? SAMPLES_PER_CYCLE : 180000;
+        short min_val = 32767, max_val = -32768;
+        for (int i = 0; i < check_samples; i++) {
+            sum += (double)dec_data->d2[i] * (double)dec_data->d2[i];
+            if (dec_data->d2[i] < min_val) min_val = dec_data->d2[i];
+            if (dec_data->d2[i] > max_val) max_val = dec_data->d2[i];
+        }
+        double rms = sqrt(sum / check_samples);
+        
+        qStdErr << "AUDIO CHECK: RMS=" << QString::number(rms, 'f', 2)
+                << " (jt9 needs >=0.5), min=" << min_val << ", max=" << max_val << "\n";
+        qStdErr << "First 20 samples: ";
+        for (int i = 0; i < 20 && i < SAMPLES_PER_CYCLE; i++) qStdErr << dec_data->d2[i] << " ";
+        qStdErr << "\n";
+        qStdErr.flush();
+
+        // THEN lock shared memory to set params and trigger decode atomically
+        // This matches the original working version's approach
+        sharedMemory->lock();
+        dec_data->params.nutc = nutc;
+        dec_data->params.kin = SAMPLES_PER_CYCLE;
+        dec_data->params.newdat = true;
+        dec_data->ipc[0] = mode.ihsym;
+        dec_data->ipc[1] = 1;   // start decode
+        dec_data->ipc[2] = -1;  // not done
+        
+        qStdErr << "PARAMS: nutc=" << nutc << ", kin=" << SAMPLES_PER_CYCLE
+                << ", ihsym=" << mode.ihsym << ", nzhsym=" << dec_data->params.nzhsym
+                << ", nmode=" << dec_data->params.nmode << ", ndiskdat=" << dec_data->params.ndiskdat
+                << ", newdat=" << dec_data->params.newdat << ", ntrperiod=" << dec_data->params.ntrperiod << "\n";
+        qStdErr.flush();
+        
+        sharedMemory->unlock();
+        
+        // RETURN IMMEDIATELY - don't wait! (matching WSJT-X line 5651)
+        // jt9 will signal us via readyReadStandardOutput when done
+    }
     
-    // Cleanup
-    delete[] circ_buffer;
+    // Called when decode is complete (matching WSJT-X decodeDone at line 5717)
+    void decodeDone() {
+        // Calculate decode duration
+        qint64 decode_end_ms = getUtcMs();
+        double decode_duration_s = (decode_end_ms - decode_start_ms) / 1000.0;
+
+        // Output machine-readable statistics to stdout
+        qStdOut << "<DecodeStats>"
+                << " cycle_num=" << total_decodes
+                << " duration_s=" << QString::number(decode_duration_s, 'f', 3)
+                << " num_decodes=" << jt9_decode_count
+                << " skipped_cycles=" << skipped_cycles
+                << " </DecodeStats>\n";
+        qStdOut.flush();
+
+        // Clear decode in progress flag BEFORE acknowledgment (matching WSJT-X line 5750)
+        decode_in_progress = false;
+        jt9_decode_count = 0;
+
+        // Acknowledge decode (matching WSJT-X: to_jt9(m_ihsym, -1, 1) at line 5756)
+        sharedMemory->lock();
+        dec_data->ipc[2] = 1;  // Tell jt9 we know it has finished
+        sharedMemory->unlock();
+    }
     
-    // Terminate jt9
-    qStdErr << "Terminating jt9...\n";
-    sharedMemory.lock();
-    dec_data->ipc[1] = 999;
-    sharedMemory.unlock();
+    void jt9Finished(int exitCode, QProcess::ExitStatus exitStatus) {
+        qStdErr << "Error: jt9 process exited unexpectedly (code: " << exitCode << ")\n";
+        qStdErr.flush();
+        QCoreApplication::quit();
+    }
     
-    return 0;
-}
+    void jt9Error(QProcess::ProcessError error) {
+        qStdErr << "Error: jt9 process error: " << error << "\n";
+        qStdErr.flush();
+        QCoreApplication::quit();
+    }
+    
+private:
+    qint64 getUtcMs() {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+    }
+    
+    qint64 msToNextCycle() {
+        qint64 now_ms = getUtcMs();
+        qint64 ms_in_cycle = now_ms % mode.cycle_ms;
+        return mode.cycle_ms - ms_in_cycle;
+    }
+    
+    QSharedMemory *sharedMemory;
+    dec_data_t *dec_data;
+    QProcess *jt9;
+    ModeConfig mode;
+    
+    short *circ_buffer;
+    int BUFFER_SIZE;
+    int SAMPLES_PER_CYCLE;
+    QMutex buffer_mutex;
+    AudioReaderThread *reader_thread;
+    
+    QTimer *cycle_timer;
+    bool decode_in_progress;
+    int total_decodes;
+    int skipped_cycles;
+    int jt9_decode_count;
+    qint64 decode_start_ms;
+};
 
 int main(int argc, char *argv[]) {
     QCoreApplication app(argc, argv);
@@ -396,8 +506,8 @@ int main(int argc, char *argv[]) {
     // Parse command-line arguments
     QString wav_file;
     int depth = 3;               // Decoding depth 1-3
-    int freq_low = 200;          // Low frequency Hz
-    int freq_high = 5000;        // High frequency Hz
+    int freq_low = 100;          // Low frequency Hz (matching WSJT-X typical range)
+    int freq_high = 3000;        // High frequency Hz (matching WSJT-X typical range)
     QString jt9_path;
     bool stream_mode = false;    // Stream PCM from stdin
     bool multithread = false;    // Multithreaded FT8 decoding
@@ -520,23 +630,52 @@ int main(int argc, char *argv[]) {
     dec_data_t *dec_data = static_cast<dec_data_t*>(sharedMemory.data());
     memset(dec_data, 0, sizeof(dec_data_t));
     
-    // Set up common parameters for decoding
+    // Set up common parameters for decoding (matching WSJT-X lines 5430-5490)
     dec_data->params.nmode = mode->mode_code;  // Mode code (52=FT2, 5=FT4, 8=FT8)
     dec_data->params.ntrperiod = mode->cycle_ms / 1000;  // TR period in seconds
     dec_data->params.ndepth = depth;
     dec_data->params.nfa = freq_low;
     dec_data->params.nfb = freq_high;
     dec_data->params.nfqso = 1500;
+    dec_data->params.nftx = 1500;  // TX frequency (not used in RX-only mode but must be set)
     dec_data->params.ntol = 100;
     dec_data->params.nagain = false;
     dec_data->params.nQSOProgress = 0;
-    dec_data->params.lapcqonly = false;
+    dec_data->params.lapcqonly = false;  // CRITICAL: false for normal RX (true would only decode CQ messages)
     dec_data->params.nsubmode = 0;
-    dec_data->params.ndiskdat = !stream_mode;  // true for WAV files, false for streaming
+    dec_data->params.ndiskdat = true;  // TESTING: Try true for both modes
     dec_data->params.lmultift8 = multithread;  // Enable multithreaded FT8 (FT8 only)
+    dec_data->params.nzhsym = mode->nzhsym;  // hsymStop - critical for decode count (WSJT-X line 2466)
+    
+    // yymmdd for non-disk data (WSJT-X line 5396)
+    if (stream_mode) {  // FIXED: was !stream_mode
+        dec_data->params.yymmdd = -1;  // Critical for streaming mode
+    }
+    
+    // Critical parameters for decode count (WSJT-X lines 5431-5434)
+    dec_data->params.n2pass = 1;  // FIXED: Was 2, should be 1 (WSJT-X line 5431)
+    dec_data->params.nranera = 10000;  // Random erasure trials (WSJT-X default)
+    dec_data->params.naggressive = 0;  // Aggressive level (0=normal, WSJT-X line 5434)
+    dec_data->params.nrobust = 0;  // Robust mode off (WSJT-X line 5435)
+    
+    // FT8 AP (a priori) decoding - CRITICAL for decode count (WSJT-X lines 5476-5478)
+    if (mode->mode_code == 8) {  // FT8
+        dec_data->params.lft8apon = true;  // Enable AP decoding
+        dec_data->params.napwid = 50;  // AP bandwidth (default for HF)
+    } else {
+        dec_data->params.lft8apon = false;
+        dec_data->params.napwid = 0;
+    }
+
+    // Set datetime (YYYYMMDD_HHMMSS format)
+    QDateTime now = QDateTime::currentDateTimeUtc();
+    QString datetime_str = now.toString("yyyyMMdd_HHmmss");
+    strncpy(dec_data->params.datetime, datetime_str.toLatin1().constData(), 20);
     
     strncpy(dec_data->params.mycall, "K1ABC", 12);
     strncpy(dec_data->params.mygrid, "FN20", 6);
+    strncpy(dec_data->params.hiscall, "", 12);  // Empty for RX-only
+    strncpy(dec_data->params.hisgrid, "", 6);   // Empty for RX-only
     
     sharedMemory.unlock();
     
@@ -599,8 +738,23 @@ int main(int argc, char *argv[]) {
     int result = 0;
     
     if (stream_mode) {
-        // Streaming mode: continuously read from stdin
-        result = stream_mode_decode(jt9_path, depth, freq_low, freq_high, sharedMemory, dec_data, jt9, *mode);
+        // Streaming mode: asynchronous event-driven processing (WSJT-X style)
+        StreamDecoder decoder(&sharedMemory, dec_data, &jt9, *mode);
+        decoder.start();
+        
+        // Run Qt event loop - processes jt9 output asynchronously
+        result = app.exec();
+        
+        // Cleanup: terminate jt9
+        qStdErr << "Terminating jt9...\n";
+        sharedMemory.lock();
+        dec_data->ipc[1] = 999;
+        sharedMemory.unlock();
+        
+        if (!jt9.waitForFinished(2000)) {
+            jt9.kill();
+            jt9.waitForFinished();
+        }
     } else {
         // WAV file mode: read file and decode once
         sharedMemory.lock();
@@ -689,3 +843,6 @@ int main(int argc, char *argv[]) {
     
     return result;
 }
+
+// Include moc file for Qt meta-object compilation
+#include "jt9_decode.moc"
