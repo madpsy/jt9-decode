@@ -225,7 +225,7 @@ public:
                   const ModeConfig &mode_cfg, QObject *parent = nullptr)
         : QObject(parent), sharedMemory(shm), dec_data(dec), jt9(jt9_proc),
           mode(mode_cfg), decode_in_progress(false), total_decodes(0),
-          skipped_cycles(0), jt9_decode_count(0)
+          skipped_cycles(0), jt9_decode_count(0), watchdog_fires(0)
     {
         SAMPLES_PER_CYCLE = (RX_SAMPLE_RATE * mode.cycle_ms) / 1000;
         BUFFER_SIZE = NTMAX * RX_SAMPLE_RATE;
@@ -248,6 +248,11 @@ public:
         // Timer for cycle boundaries
         cycle_timer = new QTimer(this);
         connect(cycle_timer, &QTimer::timeout, this, &StreamDecoder::onCycleTimer);
+
+        // Watchdog: resets stuck decode_in_progress if jt9 never sends <DecodeFinished>
+        decode_watchdog = new QTimer(this);
+        decode_watchdog->setSingleShot(true);
+        connect(decode_watchdog, &QTimer::timeout, this, &StreamDecoder::onDecodeWatchdog);
         
         qStdErr << "Stream mode: Reading 12kHz 16-bit mono PCM from stdin\n";
         qStdErr << mode.name << " cycle time: " << mode.cycle_ms << " ms (" << SAMPLES_PER_CYCLE << " samples)\n";
@@ -347,9 +352,10 @@ private slots:
             return;
         }
         
-        // Mark decode as in progress
+        // Mark decode as in progress and arm watchdog (2 full cycles as timeout)
         decode_in_progress = true;
         decode_start_ms = getUtcMs();
+        decode_watchdog->start(mode.cycle_ms * 2);
 
         // Get current UTC time
         time_t now = time(NULL);
@@ -401,8 +407,27 @@ private slots:
         // jt9 will signal us via readyReadStandardOutput when done
     }
     
+    // Called if jt9 never sends <DecodeFinished> within 2 cycle periods
+    void onDecodeWatchdog() {
+        watchdog_fires++;
+        qStdErr << "Warning: Decode watchdog fired (total: " << watchdog_fires
+                << ") - jt9 did not finish in time, resetting state\n";
+        qStdErr.flush();
+
+        // Reset flag so the next cycle can trigger a fresh decode
+        decode_in_progress = false;
+        jt9_decode_count = 0;
+
+        // Force-acknowledge so jt9 is not left waiting for ipc[2]
+        sharedMemory->lock();
+        dec_data->ipc[2] = 1;
+        sharedMemory->unlock();
+    }
+
     // Called when decode is complete (matching WSJT-X decodeDone at line 5717)
     void decodeDone() {
+        // Cancel watchdog - clean finish, no recovery needed
+        decode_watchdog->stop();
         // Calculate decode duration
         qint64 decode_end_ms = getUtcMs();
         double decode_duration_s = (decode_end_ms - decode_start_ms) / 1000.0;
@@ -463,10 +488,12 @@ private:
     AudioReaderThread *reader_thread;
     
     QTimer *cycle_timer;
+    QTimer *decode_watchdog;
     bool decode_in_progress;
     int total_decodes;
     int skipped_cycles;
     int jt9_decode_count;
+    int watchdog_fires;
     qint64 decode_start_ms;
 };
 
