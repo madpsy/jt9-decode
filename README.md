@@ -22,9 +22,7 @@ A standalone command-line wrapper for the WSJT-X jt9 decoder engine, supporting 
 
 - **C++ compiler** (g++)
 - **Qt5 Core library** (libqt5core5a)
-  - Debian/Ubuntu: `sudo apt install libqt5core5a`
-  - Fedora/RHEL: `sudo dnf install qt5-qtbase`
-  - Arch Linux: `sudo pacman -S qt5-base`
+  - Debian/Ubuntu: `sudo apt install libqt5core5a qtbase5-dev qtchooser pkg-config`
 - **jt9 binary** from WSJT-X (must be compiled separately)
 
 ### Audio Format Requirements
@@ -35,11 +33,13 @@ A standalone command-line wrapper for the WSJT-X jt9 decoder engine, supporting 
 ## Compilation
 
 ```bash
+moc jt9_decode.cpp -o jt9_decode.moc
 g++ -o jt9_decode jt9_decode.cpp -I./wsjtx -fPIC $(pkg-config --cflags --libs Qt5Core) -std=c++11
 ```
 
 Or with explicit paths:
 ```bash
+moc jt9_decode.cpp -o jt9_decode.moc
 g++ -o jt9_decode jt9_decode.cpp -I/usr/include/x86_64-linux-gnu/qt5 \
     -I/usr/include/x86_64-linux-gnu/qt5/QtCore -I./wsjtx -fPIC -lQt5Core -lrt
 ```
