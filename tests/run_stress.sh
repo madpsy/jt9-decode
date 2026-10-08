@@ -7,8 +7,11 @@
 # Every run must end with a normal exit (never a signal / abort / sanitizer
 # report), and leave no jt9 process, shared memory, semaphore or temp dir.
 #
-# Environment: JT9=<path> (default: jt9 from PATH), FUZZ_N (default 400),
-#              SOAK_S (default 120)
+# Environment: JT9=<path> (default: jt9 from PATH)
+#              FULL=1  every stage at full size (~15 min). The default runs
+#                      every stage too, with fewer repetitions (~3 min), and
+#                      skips the real-time soak.
+#              FUZZ_N, SOAK_S override the fuzz count and soak length
 #
 set -u
 
@@ -16,8 +19,15 @@ BIN=$(readlink -f "$1")
 ASAN=$(readlink -f "$2")
 TSAN=$(readlink -f "$3")
 JT9=${JT9:-$(command -v jt9)}
-FUZZ_N=${FUZZ_N:-400}
-SOAK_S=${SOAK_S:-120}
+if [ "${FULL:-}" = 1 ]; then
+    def_fuzz=400; REAL_N=24; CYC=3; KILL_N=5; SIG_N=25; CONC=8; def_soak=120
+    WAV_SIG_DELAYS="0.05 0.5 1.5 2.05"
+else
+    def_fuzz=120; REAL_N=4; CYC=2; KILL_N=2; SIG_N=8; CONC=4; def_soak=0
+    WAV_SIG_DELAYS="0.05 1.5"
+fi
+FUZZ_N=${FUZZ_N:-$def_fuzz}
+SOAK_S=${SOAK_S:-$def_soak}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 WAV=$ROOT/test_ft8.wav
@@ -164,14 +174,14 @@ fi
 check_clean "WAV fuzz"
 
 # Same with the real jt9 on a sample (it really reads the audio)
-ls fuzz/*.wav | shuf -n 24 --random-source=<(yes) >real_sample.txt
+ls fuzz/*.wav | shuf -n "$REAL_N" --random-source=<(yes) >real_sample.txt
 real_fail=0
 while read -r f; do
     timeout 60 "$ASAN" -j "$JT9" -m FT8 "$f" >"$f.rout" 2>"$f.rerr"
     rc=$?
     check_run "fuzz+real jt9 $f" $rc "$f.rerr" >/dev/null || { real_fail=1; echo "  $f rc=$rc"; }
 done < real_sample.txt
-[ $real_fail = 0 ] && ok "WAV fuzz with real jt9: 24 inputs ok" || bad "WAV fuzz with real jt9"
+[ $real_fail = 0 ] && ok "WAV fuzz with real jt9: $REAL_N inputs ok" || bad "WAV fuzz with real jt9"
 check_clean "WAV fuzz real jt9"
 
 # ---- 2. Real decodes under ASan/UBSan --------------------------------------------
@@ -201,25 +211,25 @@ stream_run() {
     check_clean "$name"
 }
 
-stream_run asan_stream_ft8 "$ASAN" "cat ft8.raw; sleep 3019" "cycle_num=1 .*num_decodes=10 " 60 -m FT8 -s -j "$JT9"
-stream_run asan_stream_ft2 "$ASAN" "cat ft8.raw; sleep 3019" "cycle_num=4 " 60 -m FT2 -s -j "$JT9"
+[ "${FULL:-}" = 1 ] && stream_run asan_stream_ft8 "$ASAN" "cat ft8.raw; sleep 3019" "cycle_num=1 .*num_decodes=10 " 60 -m FT8 -s -j "$JT9"
+stream_run asan_stream_ft2 "$ASAN" "cat ft8.raw; sleep 3019" "cycle_num=$((CYC + 1)) " 60 -m FT2 -s -j "$JT9"
 
 # ---- 3. Hostile stdin ---------------------------------------------------------------
 echo "3. Hostile stdin under ASan/UBSan"
-stream_run asan_random_audio "$ASAN" "head -c 2000000 /dev/urandom; sleep 3019" "cycle_num=3 " 60 -m FT2 -s -j "$JT9"
+stream_run asan_random_audio "$ASAN" "head -c 2000000 /dev/urandom; sleep 3019" "cycle_num=$CYC " 60 -m FT2 -s -j "$JT9"
 stream_run asan_odd_bytes "$ASAN" "python3 -c \"
 import sys,time,os
 o=sys.stdout.buffer
 for i in range(30000):
     o.write(os.urandom(1 + (i % 7) * 2)); o.flush()
-time.sleep(3019)\"" "cycle_num=2 " 60 -m FT2 -s -j "$JT9"
+time.sleep(3019)\"" "cycle_num=$CYC " 60 -m FT2 -s -j "$JT9"
 stream_run asan_empty_stdin "$ASAN" "true" "Waiting for first cycle boundary" 10 -m FT8 -s -j "$JT9"
 stream_run asan_tiny_stdin "$ASAN" "printf x; sleep 3019" "Waiting for first cycle boundary" 10 -m FT2 -s -j "$JT9"
 
 # ---- 4. Misbehaving jt9 -------------------------------------------------------------
 echo "4. Misbehaving jt9 under ASan/UBSan"
 # never answers: watchdog must fire and recover repeatedly
-stream_run asan_jt9_hang "$ASAN" "cat ft8.raw; sleep 3019" "watchdog fired \\(total: 2\\)" 60 -m FT2 -s -j "$WORK/fake/fake_jt9_hang"
+stream_run asan_jt9_hang "$ASAN" "cat ft8.raw; sleep 3019" "watchdog fired \\(total: $((CYC - 1))\\)" 60 -m FT2 -s -j "$WORK/fake/fake_jt9_hang"
 # exits right away: must be noticed and reported
 cat ft8.raw | "$ASAN" -m FT2 -s -j "$WORK/fake/fake_jt9_exit" >asan_jt9_exit.out 2>asan_jt9_exit.err &
 p=$!; n=0; while kill -0 $p 2>/dev/null && [ $n -lt 100 ]; do sleep 0.1; n=$((n+1)); done
@@ -229,10 +239,10 @@ check_run "jt9 exits at start" $rc asan_jt9_exit.err && grep -q 'exited unexpect
     && ok "jt9 exits at start: reported, exit $rc" || bad "jt9 exits at start: not reported"
 check_clean "jt9 exits at start"
 # hostile output for 20s
-stream_run asan_jt9_spew "$ASAN" "cat ft8.raw; sleep 3019" "cycle_num=3 " 60 -m FT2 -s -j "$WORK/fake/fake_jt9_spew"
+stream_run asan_jt9_spew "$ASAN" "cat ft8.raw; sleep 3019" "cycle_num=$CYC " 60 -m FT2 -s -j "$WORK/fake/fake_jt9_spew"
 # jt9 killed at random moments
 kill_fail=0
-for i in 1 2 3 4 5; do
+for i in $(seq "$KILL_N"); do
     (cat ft8.raw; sleep 3019) | "$ASAN" -m FT2 -s -j "$JT9" >kill_$i.out 2>kill_$i.err &
     p=$!
     sleep "$(python3 -c "import random;print(round(random.uniform(0.2,8),2))")"
@@ -242,13 +252,13 @@ for i in 1 2 3 4 5; do
     pkill -f "sleep.3019"; wait $p; rc=$?
     check_run "jt9 killed #$i" $rc kill_$i.err || kill_fail=1
 done
-[ $kill_fail = 0 ] && ok "jt9 killed at random moments: 5 runs, wrapper always exited normally"
+[ $kill_fail = 0 ] && ok "jt9 killed at random moments: $KILL_N runs, wrapper always exited normally"
 check_clean "jt9 killed at random"
 
 # ---- 5. Signals at random moments ----------------------------------------------------
-echo "5. SIGTERM/SIGINT at random moments (25 runs, ASan)"
+echo "5. SIGTERM/SIGINT at random moments ($SIG_N runs, ASan)"
 sig_fail=0
-for i in $(seq 25); do
+for i in $(seq "$SIG_N"); do
     sig=$([ $((i % 2)) = 0 ] && echo TERM || echo INT)
     (cat ft8.raw; sleep 3019) | "$ASAN" -m FT2 -s -j "$JT9" >sig_$i.out 2>sig_$i.err &
     p=$!
@@ -260,10 +270,10 @@ for i in $(seq 25); do
     check_run "signal run $i ($sig)" $rc sig_$i.err || sig_fail=1
     [ -n "$(leftovers)" ] && { bad "signal run $i: left behind: $(leftovers)"; sig_fail=1; break; }
 done
-[ $sig_fail = 0 ] && ok "25 signals at random moments: clean exit, nothing left behind"
+[ $sig_fail = 0 ] && ok "$SIG_N signals at random moments: clean exit, nothing left behind"
 
 # WAV mode interrupted too
-for d in 0.05 0.5 1.5 2.05; do
+for d in $WAV_SIG_DELAYS; do
     "$ASAN" -j "$JT9" -m FT8 "$WAV" >wsig.out 2>wsig.err &
     p=$!; sleep $d; kill -TERM $p
     t0=$SECONDS; wait $p; rc=$?
@@ -274,7 +284,7 @@ check_clean "WAV mode SIGTERM"
 
 # ---- 6. Closed stdout (downstream went away) ------------------------------------------
 echo "6. Closed stdout"
-(cat ft8.raw; sleep 3019) | "$ASAN" -m FT8 -s -j "$JT9" 2>pipe.err | head -c 1 >/dev/null &
+(cat ft8.raw; sleep 3019) | "$ASAN" -m FT2 -s -j "$JT9" 2>pipe.err | head -c 1 >/dev/null &
 for _ in $(seq 300); do grep -q 'cannot write to stdout' pipe.err && break; sleep 0.1; done
 pkill -f "sleep.3019"; wait
 grep -q 'cannot write to stdout' pipe.err && ok "closed stdout: detected and shut down" || bad "closed stdout: not handled"
@@ -293,28 +303,29 @@ d=open('ft8.raw','rb').read()
 o=sys.stdout.buffer
 while True:
     for i in range(0,len(d),2400): o.write(d[i:i+2400]); o.flush(); time.sleep(0.1)
-\"" "cycle_num=4 " 60 -m FT2 -s -j "$JT9"
+\"" "cycle_num=$((CYC + 1)) " 60 -m FT2 -s -j "$JT9"
 pkill -f "range\(0,len\(d\),2400\)" 2>/dev/null
 
 # ---- 8. Many concurrent instances --------------------------------------------------------
-echo "8. 8 concurrent stream instances + 8 concurrent WAV decodes"
+echo "8. $CONC concurrent stream instances + $CONC concurrent WAV decodes"
 pids=()
-for i in $(seq 8); do
+for i in $(seq "$CONC"); do
     (cat ft8.raw; sleep 3019) | "$BIN" -m FT2 -s -j "$JT9" >conc_$i.out 2>conc_$i.err &
     pids+=($!)
 done
-for i in $(seq 8); do "$BIN" -j "$JT9" -m FT8 "$WAV" >concw_$i.out 2>concw_$i.err & done
-for i in $(seq 8); do wait_for conc_$i.out "cycle_num=3 " 60 || bad "concurrent stream $i stalled"; done
+for i in $(seq "$CONC"); do "$BIN" -j "$JT9" -m FT8 "$WAV" >concw_$i.out 2>concw_$i.err & done
+for i in $(seq "$CONC"); do wait_for conc_$i.out "cycle_num=$CYC " 60 || bad "concurrent stream $i stalled"; done
 for p in "${pids[@]}"; do stop_run $p; done
 pkill -f "sleep.3019"; wait
 conc_ok=1
-for i in $(seq 8); do
+for i in $(seq "$CONC"); do
     [ "$(grep -cE '^[0-9]{6} ' concw_$i.out)" = 10 ] || { bad "concurrent WAV $i: $(grep -cE '^[0-9]{6} ' concw_$i.out) decodes"; conc_ok=0; }
 done
-[ $conc_ok = 1 ] && ok "concurrent: 8 streams reached cycle 3, 8 WAV runs each got all 10 decodes"
+[ $conc_ok = 1 ] && ok "concurrent: $CONC streams reached cycle $CYC, $CONC WAV runs each got all 10 decodes"
 check_clean "concurrent"
 
 # ---- 9. Soak: real-time stream -------------------------------------------------------------
+if [ "$SOAK_S" -gt 0 ]; then
 echo "9. Soak: ${SOAK_S}s real-time FT8 stream under ASan"
 python3 - <<'EOF' >soak_gen.py
 print('''
@@ -341,6 +352,9 @@ expected=$((SOAK_S / 15 - 2))
 [ "$cycles" -ge "$expected" ] && ok "soak: at least $expected cycles" || bad "soak: only $cycles cycles"
 grep -q 'watchdog fired' soak.err && bad "soak: watchdog fired"
 check_clean "soak"
+else
+    echo "9. Soak: skipped (FULL=1 or SOAK_S=<seconds> to run it)"
+fi
 
 echo
 echo "$pass passed, $fail failed"

@@ -8,7 +8,7 @@ INCLUDES = -I./wsjtx
 CXXFLAGS = -std=c++11 -O2 -Wall -Wextra -fPIC
 LDFLAGS = -pthread -lrt
 
-.PHONY: all clean test test-interop test-e2e test-stress install uninstall
+.PHONY: all clean test test-full test-interop test-e2e test-stress install uninstall
 
 all: $(TARGET)
 
@@ -42,6 +42,8 @@ $(TEST_BUILD)/jt9_decode_tsan: $(SOURCE) $(HEADERS) | $(TEST_BUILD)
 test-interop: $(TEST_BUILD)/qt_ref_helper $(TEST_BUILD)/test_shm_interop
 	$(TEST_BUILD)/test_shm_interop $(TEST_BUILD)/qt_ref_helper
 
+# FULL=1 runs every e2e/stress case at full size (~15 min); the default is a
+# representative subset of every stage (~5 min). `make test-full` sets it.
 test-e2e: $(TARGET)
 	$(TEST_DIR)/run_e2e.sh ./$(TARGET)
 
@@ -49,6 +51,9 @@ test-stress: $(TARGET) $(TEST_BUILD)/jt9_decode_asan $(TEST_BUILD)/jt9_decode_ts
 	$(TEST_DIR)/run_stress.sh ./$(TARGET) $(TEST_BUILD)/jt9_decode_asan $(TEST_BUILD)/jt9_decode_tsan
 
 test: test-interop test-e2e test-stress
+
+test-full:
+	$(MAKE) FULL=1 test
 
 clean:
 	rm -f $(TARGET)

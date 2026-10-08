@@ -436,7 +436,9 @@ public:
           jt9_decode_count(0), watchdog_fires(0), decode_start_ms(0)
     {
         SAMPLES_PER_CYCLE = (RX_SAMPLE_RATE * mode.cycle_ms) / 1000;
-        BUFFER_SIZE = NTMAX * RX_SAMPLE_RATE;
+        // Only the most recent cycle is ever read, so two cycles is plenty.
+        // (A 30 minute buffer would slowly become ~43 MB resident.)
+        BUFFER_SIZE = 2 * SAMPLES_PER_CYCLE;
 
         // Allocate circular buffer
         circ_buffer = new short[BUFFER_SIZE];
@@ -895,7 +897,9 @@ int main(int argc, char *argv[]) {
     // Lock and initialize
     sharedMemory.lock();
     dec_data_t *dec_data = static_cast<dec_data_t*>(sharedMemory.data());
-    memset(dec_data, 0, sizeof(dec_data_t));
+    // No memset: create() always makes a new segment (unique key, IPC_EXCL) and
+    // the kernel zero-fills it. Writing all 48 MB would make every page
+    // resident, while FT8 only ever touches ~360 KB of the audio buffer.
 
     // Set up common parameters for decoding (matching WSJT-X lines 5430-5490)
     dec_data->params.nmode = mode->mode_code;  // Mode code (52=FT2, 5=FT4, 8=FT8)

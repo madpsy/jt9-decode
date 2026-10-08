@@ -59,10 +59,14 @@ assets on the release; anything else on it is left alone. See `./build.sh --help
 ## Tests
 
 ```bash
+make test           # everything below, fast tier (~5 min)
+make test-full      # everything at full size, including a 2 min soak (~15 min)
+
 make test-interop   # shared memory/lock interop against real QSharedMemory
-make test-e2e       # real jt9: WAV + stream decodes vs golden output, errors, cleanup
-make test-stress    # ASan/UBSan/TSan, WAV fuzzing, hostile stdin/jt9, signals, soak
-make test           # all of the above
+make test-e2e       # real jt9: WAV + stream decodes vs golden output, errors,
+                    # memory use, cleanup
+make test-stress    # ASan/UBSan/TSan, WAV fuzzing, hostile stdin/jt9, signals,
+                    # concurrency (FULL=1 adds the soak and more repetitions)
 ```
 
 The tests need `jt9`, `sox` and `python3`. `test-interop` also needs the Qt 5

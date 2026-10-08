@@ -10,7 +10,8 @@
 #                every WAV/error case is run on both binaries and exit code,
 #                stdout decodes and normalised stderr must match exactly.
 #   RECORD=1     rewrite tests/golden/* from the binary under test
-#   QUICK=1      skip the slow stream-mode tests
+#   FULL=1       run every case (default: a representative subset, ~2 min)
+#   QUICK=1      skip the stream-mode tests
 #
 set -u
 
@@ -29,6 +30,7 @@ cd "$WORK" || exit 1   # jt9 writes timer.out / wisdom files into its cwd
 pass=0
 fail=0
 ok()   { pass=$((pass + 1)); echo "  ok   $*"; }
+full() { [ "${FULL:-}" = 1 ]; }
 bad()  { fail=$((fail + 1)); echo "  FAIL $*"; }
 
 # Decode text without the time column (which is the current UTC), sorted
@@ -166,15 +168,17 @@ expect_golden ft8_wav new_ft8_stereo.out
 diff_case ft8_extra_chunks -j "$JT9" -m ft8 extra_chunks.wav
 expect_golden ft8_wav new_ft8_extra_chunks.out
 grep -q 'Skipping chunk "LIST" (12 bytes)' new_ft8_extra_chunks.err && ok "LIST chunk skipped" || bad "LIST chunk not reported"
-diff_case ft8_depth1 -j "$JT9" -m FT8 -d 1 "$WAV"
-expect_golden ft8_wav_depth1 new_ft8_depth1.out
-diff_case ft8_multithread -j "$JT9" -m FT8 -t "$WAV"
-expect_golden ft8_wav new_ft8_multithread.out
 diff_case ft8_truncated -j "$JT9" -m FT8 truncated.wav
-diff_case ft8_header_only -j "$JT9" -m FT8 header_only.wav
-diff_case ft4_wav -j "$JT9" -m FT4 "$WAV"
 diff_case ft2_wav -j "$JT9" -m FT2 "$WAV"
-diff_case default_mode -j "$JT9" "$WAV"
+if full; then
+    diff_case ft8_depth1 -j "$JT9" -m FT8 -d 1 "$WAV"
+    expect_golden ft8_wav_depth1 new_ft8_depth1.out
+    diff_case ft8_multithread -j "$JT9" -m FT8 -t "$WAV"
+    expect_golden ft8_wav new_ft8_multithread.out
+    diff_case ft8_header_only -j "$JT9" -m FT8 header_only.wav
+    diff_case ft4_wav -j "$JT9" -m FT4 "$WAV"
+    diff_case default_mode -j "$JT9" "$WAV"
+fi
 
 # ---- Argument / error handling ------------------------------------------------
 echo "Errors"
@@ -244,20 +248,22 @@ first_cycle=$(awk '/^<DecodeStats> cycle_num=1 /{exit} {print}' stream_ft8.out >
 expect_golden ft8_stream "$first_cycle"
 grep -q 'num_decodes=10 ' stream_ft8.out && ok "stream_ft8: jt9 reported 10 decodes" || bad "stream_ft8: jt9 decode count"
 
-# stdin closed after the data (EOF): must keep decoding the buffered audio
-stream_case stream_ft8_eof 1 "cat ft8.raw" -m FT8 -s -j "$JT9"
+if full; then
+    # stdin closed after the data (EOF): must keep decoding the buffered audio
+    stream_case stream_ft8_eof 1 "cat ft8.raw" -m FT8 -s -j "$JT9"
 
-# Odd-sized writes that split samples across reads
-stream_case stream_ft8_odd_chunks 1 "python3 -c \"
+    # Odd-sized writes that split samples across reads
+    stream_case stream_ft8_odd_chunks 1 "python3 -c \"
 import sys,time,random
 d=open('ft8.raw','rb').read(); i=0; o=sys.stdout.buffer
 while i<len(d):
     n=random.choice([1,3,7,333,4097]); o.write(d[i:i+n]); o.flush(); i+=n
 time.sleep(300)\"" -m FT8 -s -j "$JT9"
-first_cycle=$(awk '/^<DecodeStats> cycle_num=1 /{exit} {print}' stream_ft8_odd_chunks.out > odd.c1; echo odd.c1)
-expect_golden ft8_stream "$first_cycle"
+    first_cycle=$(awk '/^<DecodeStats> cycle_num=1 /{exit} {print}' stream_ft8_odd_chunks.out > odd.c1; echo odd.c1)
+    expect_golden ft8_stream "$first_cycle"
 
-stream_case stream_ft4 2 "cat ft8.raw; sleep 3017" -m FT4 -s -j "$JT9"
+    stream_case stream_ft4 2 "cat ft8.raw; sleep 3017" -m FT4 -s -j "$JT9"
+fi
 stream_case stream_ft2 3 "cat ft8.raw; sleep 3017" -m FT2 -s -j "$JT9"
 
 # Cycle boundaries must be UTC aligned (FT2: multiples of 3.75s)
@@ -265,6 +271,42 @@ awk '/Triggering decode #/{sub(/s$/,"",$6); sub(/^\+/,"",$6); print $6}' stream_
     python3 -c "import sys;s=float(sys.argv[1]);r=(s*1000)%3750;sys.exit(0 if min(r,3750-r)<300 else 1)" "$s" || echo "misaligned $s"
 done >ft2_align.txt
 [ -s ft2_align.txt ] && bad "stream_ft2: $(cat ft2_align.txt | head -3)" || ok "stream_ft2: decodes triggered on 3.75s UTC boundaries"
+
+# Memory: after more than 30 minutes of audio, the wrapper must hold only a
+# couple of cycles (not a 30 minute ring buffer) and the 48 MB shared segment
+# must stay mostly unallocated (no memset over it; FT2 writes ~90 KB of audio)
+echo "Memory use"
+cat >feed.py <<'PYEOF'
+import sys, time
+d = open("ft8.raw", "rb").read(); o = sys.stdout.buffer; n = 0
+while n < 50_000_000:
+    o.write(d); o.flush(); n += len(d)
+time.sleep(600)
+PYEOF
+mkfifo mem.fifo
+python3 feed.py >mem.fifo 2>/dev/null &
+feeder=$!
+"$BIN" -m FT2 -s -j "$JT9" <mem.fifo >mem.out 2>mem.err &
+wpid=$!
+if wait_for mem.out "cycle_num=1 " 60; then
+    anon_kb=$(awk '/^RssAnon:/{print $2}' /proc/$wpid/status)
+    seg_kb=$(awk -v p="$wpid" '$5 == p {print int($(NF-1) / 1024)}' /proc/sysvipc/shm)
+    if [ -n "$anon_kb" ] && [ "$anon_kb" -lt 4096 ]; then
+        ok "memory: jt9_decode private memory ${anon_kb} KB after 50 MB of audio"
+    else
+        bad "memory: jt9_decode private memory ${anon_kb:-?} KB (expected < 4 MB)"
+    fi
+    if [ -n "$seg_kb" ] && [ "$seg_kb" -lt 4096 ]; then
+        ok "memory: shared segment resident ${seg_kb} KB of 47 MB"
+    else
+        bad "memory: shared segment resident ${seg_kb:-?} KB (expected < 4 MB)"
+    fi
+else
+    bad "memory: no decode cycle"; tail -5 mem.err
+fi
+kill -TERM "$wpid" 2>/dev/null; kill "$feeder" 2>/dev/null
+wait "$wpid" "$feeder" 2>/dev/null
+check_clean memory
 
 # jt9 dies mid-stream: wrapper must notice, report and exit
 echo "jt9 crash in stream mode"
