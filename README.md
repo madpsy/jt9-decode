@@ -345,7 +345,7 @@ ldd ./jt9_decode
   - **FT2**: mode code 52, 105 symbols, 3.75s cycles
   - **FT4**: mode code 5, 105 symbols, 7.5s cycles
   - **FT8**: mode code 8, 50 symbols, 15s cycles
-- Configures frequency range 200-5000 Hz by default
+- Decodes audio from 100 to 3000 Hz (fixed; not a command-line option)
 - Streaming mode uses circular buffer with mode-specific cycle timing
 - UTC-aligned decode triggers for proper timing synchronization
 - Keeps jt9 process running in streaming mode for efficiency

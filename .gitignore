@@ -27,3 +27,7 @@ Thumbs.db
 # Release build output
 dist/
 .cache/
+
+# jt9 runtime output (written to its working directory)
+timer.out
+jt9_wisdom.dat
