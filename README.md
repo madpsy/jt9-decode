@@ -20,10 +20,12 @@ A standalone command-line wrapper for the WSJT-X jt9 decoder engine, supporting 
 
 ### System Dependencies
 
-- **C++ compiler** (g++)
-- **Qt5 Core library** (libqt5core5a)
-  - Debian/Ubuntu: `sudo apt install libqt5core5a qtbase5-dev qtchooser pkg-config`
+- **C++ compiler** (g++, C++11) - no other libraries are needed
 - **jt9 binary** from WSJT-X (must be compiled separately)
+  - jt9 must be built against **Qt 5** (as WSJT-X releases are). jt9 attaches to
+    our shared memory with `QSharedMemory`; jt9_decode reproduces Qt 5's System V
+    key scheme without linking Qt (see `qt_shm_compat.h`). A jt9 built against
+    Qt >= 6.6 configured for POSIX IPC would not be able to attach.
 
 ### Audio Format Requirements
 
@@ -33,16 +35,42 @@ A standalone command-line wrapper for the WSJT-X jt9 decoder engine, supporting 
 ## Compilation
 
 ```bash
-moc jt9_decode.cpp -o jt9_decode.moc
-g++ -o jt9_decode jt9_decode.cpp -I./wsjtx -fPIC $(pkg-config --cflags --libs Qt5Core) -std=c++11
+make
 ```
 
-Or with explicit paths:
+or directly:
 ```bash
-moc jt9_decode.cpp -o jt9_decode.moc
-g++ -o jt9_decode jt9_decode.cpp -I/usr/include/x86_64-linux-gnu/qt5 \
-    -I/usr/include/x86_64-linux-gnu/qt5/QtCore -I./wsjtx -fPIC -lQt5Core -lrt
+g++ -o jt9_decode jt9_decode.cpp -I./wsjtx -std=c++11 -O2 -pthread -lrt
 ```
+
+### Release builds (amd64 + arm64)
+
+```bash
+./build.sh                    # build dist/jt9_decode_amd64 and dist/jt9_decode_arm64
+./build.sh --publish          # ...and upload them to the GitHub release named in VERSION
+```
+
+Binaries are built in `ubuntu:24.04` containers (arm64 under binfmt/qemu) and
+linked fully statically, so they run on any amd64/arm64 Linux. Each one is then
+checked by decoding `test_ft8.wav` with the real jt9 from that architecture's
+WSJT-X .deb on the 1.0.0 release. Publishing replaces only the `jt9_decode_*`
+assets on the release; anything else on it is left alone. See `./build.sh --help`.
+
+## Tests
+
+```bash
+make test-interop   # shared memory/lock interop against real QSharedMemory
+make test-e2e       # real jt9: WAV + stream decodes vs golden output, errors, cleanup
+make test-stress    # ASan/UBSan/TSan, WAV fuzzing, hostile stdin/jt9, signals, soak
+make test           # all of the above
+```
+
+The tests need `jt9`, `sox` and `python3`. `test-interop` also needs the Qt 5
+development package (`qtbase5-dev`) to build its reference helper; Qt is never
+needed to build or run `jt9_decode` itself.
+
+`tests/run_e2e.sh` can compare against another build of jt9_decode
+(e.g. the old Qt version): `REF=/path/to/old/jt9_decode tests/run_e2e.sh ./jt9_decode`.
 
 ## Usage
 
@@ -78,6 +106,7 @@ g++ -o jt9_decode jt9_decode.cpp -I/usr/include/x86_64-linux-gnu/qt5 \
   - Uses multiple CPU cores for faster decoding
   - Can decode more simultaneous signals
   - Provides better performance on busy bands
+- `--version` - Show version
 - `--help` - Show help message
 
 ## Examples
@@ -280,41 +309,19 @@ Ensure it's 12 kHz, 16-bit audio.
 
 ## Deployment and Portability
 
-The `jt9_decode` binary is **dynamically linked** and requires Qt5 libraries to be installed on the target system.
+The `jt9_decode` binary only depends on the C/C++ runtime (libstdc++, libgcc_s,
+libc). jt9 itself still needs whatever libraries it was built with (including Qt 5).
 
 ### Copying to Another PC
 
-To deploy on another Linux system:
-
-1. **Install Qt5 on the target system:**
-   ```bash
-   # Debian/Ubuntu
-   sudo apt install libqt5core5a
-   
-   # Fedora/RHEL
-   sudo dnf install qt5-qtbase
-   
-   # Arch Linux
-   sudo pacman -S qt5-base
-   ```
-
-2. **Copy both binaries:**
+1. **Copy both binaries:**
    - `jt9_decode` (the wrapper)
    - `jt9` (the decoder binary from WSJT-X)
 
-3. **Make executable:**
+2. **Make executable:**
    ```bash
    chmod +x jt9_decode jt9
    ```
-
-### Dependencies
-
-The binary requires these shared libraries (automatically provided by Qt5 installation):
-- libQt5Core.so.5
-- libstdc++.so.6
-- libgcc_s.so.1
-- libc.so.6
-- ICU libraries (libicui18n, libicuuc, libicudata)
 
 Check dependencies with:
 ```bash
@@ -323,9 +330,13 @@ ldd ./jt9_decode
 
 ## Technical Details
 
-- Uses Qt's QSharedMemory for IPC with jt9
+- Uses Qt-compatible System V shared memory for IPC with jt9 (no Qt dependency)
+- SIGINT/SIGTERM shut down cleanly: jt9 is stopped and the shared memory,
+  semaphore and temp directory are removed
 - Implements the same shared memory protocol as WSJT-X
 - Properly handles WAV files with LIST/INFO metadata chunks
+- WAV mode waits for jt9 to report the decode finished (up to 120 s), so slow
+  CPUs such as a Raspberry Pi never have a decode cut short
 - Supports multiple modes with correct parameters:
   - **FT2**: mode code 52, 105 symbols, 3.75s cycles
   - **FT4**: mode code 5, 105 symbols, 7.5s cycles

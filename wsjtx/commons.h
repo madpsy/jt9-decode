@@ -7,7 +7,6 @@
 
 #ifdef __cplusplus
 #include <cstdbool>
-#include <QString>
 #else
 #include <stdbool.h>
 #endif

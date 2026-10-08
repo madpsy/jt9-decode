@@ -23,3 +23,7 @@ cmake-build-*/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Release build output
+dist/
+.cache/
