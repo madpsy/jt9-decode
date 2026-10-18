@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <iostream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -757,6 +758,113 @@ static void usage_hint(const char *argv0) {
     fprintf(stderr, "Use --help for more information\n");
 }
 
+// The UTC of a period as HHMMSS: from "HHMMSS" given after the file name, else from the file name
+// (ka9q-radio pcmrecord's YYYYMMDDTHHMMSSZ_..., or WSJT-X's ..._HHMMSS.wav), else the clock.
+static int period_utc(const std::string &path, const std::string &given) {
+    if (given.size() == 6 && std::all_of(given.begin(), given.end(), ::isdigit)) return to_int(given.c_str());
+    const std::string name = path.substr(path.find_last_of('/') == std::string::npos ? 0 : path.find_last_of('/') + 1);
+    for (size_t i = 0; i + 8 <= name.size(); i++) {
+        if (name[i] == 'T' && name[i + 7] == 'Z' &&
+            std::all_of(name.begin() + i + 1, name.begin() + i + 7, ::isdigit))
+            return to_int(name.substr(i + 1, 6).c_str());
+    }
+    size_t dot = name.rfind(".wav");
+    if (dot != std::string::npos && dot >= 7 && name[dot - 7] == '_' &&
+        std::all_of(name.begin() + dot - 6, name.begin() + dot, ::isdigit))
+        return to_int(name.substr(dot - 6, 6).c_str());
+    time_t now = time(NULL);
+    struct tm tm_info;
+    gmtime_r(&now, &tm_info);
+    return tm_info.tm_hour * 10000 + tm_info.tm_min * 100 + tm_info.tm_sec;
+}
+
+// File-feed mode: one jt9 decodes every WAV file named on stdin, in turn, so the state jt9 keeps from period to
+// period (FT8's and FT4's callsign hash table and a-priori calls) carries across them, as in WSJT-X, where a
+// fresh jt9 a file forgets every hashed call.  Each file is decoded as soon as its name arrives, at its own UTC,
+// not at the clock's cycle boundary as -s does.
+static int run_feed(SharedMemory &sharedMemory, dec_data_t *dec_data, Jt9Process &jt9, const ModeConfig &mode) {
+    const int cycle_samples = (RX_SAMPLE_RATE * mode.cycle_ms) / 1000;
+    const int64_t DECODE_TIMEOUT_MS = 120000;
+    std::string line;
+    while (!got_signal && std::getline(std::cin, line)) {
+        line = trimmed(line);
+        if (line.empty()) continue;
+        std::string path = line, given;
+        size_t sp = line.find_last_of(" \t");
+        if (sp != std::string::npos) {
+            path = trimmed(line.substr(0, sp));
+            given = line.substr(sp + 1);
+        }
+        if (!jt9.isRunning()) {
+            fprintf(stderr, "Error: jt9 process exited unexpectedly (code: %d)\n", jt9.exitCode());
+            return 1;
+        }
+        sharedMemory.lock();
+        memset(dec_data->d2, 0, sizeof(short) * cycle_samples);
+        int nsamples = read_wav_file(path, dec_data->d2, cycle_samples);
+        if (nsamples < 0) {
+            sharedMemory.unlock();
+            printf("<FileDone> %s 0\n", path.c_str());
+            fflush(stdout);
+            continue;
+        }
+        dec_data->params.nutc = period_utc(path, given);
+        dec_data->params.kin = nsamples;
+        dec_data->params.newdat = true;
+        dec_data->ipc[0] = mode.ihsym;
+        dec_data->ipc[1] = 1;   // start decoding
+        dec_data->ipc[2] = -1;  // not done
+        sharedMemory.unlock();
+
+        int64_t deadline = getUtcMs() + DECODE_TIMEOUT_MS;
+        size_t done;
+        while ((done = jt9.buffer.find("<DecodeFinished>")) == std::string::npos && !got_signal &&
+               getUtcMs() < deadline) {
+            if (jt9.waitFinished(100)) break;  // jt9 exited
+        }
+        int ndecodes = 0;
+        size_t end = done == std::string::npos ? jt9.buffer.size() : jt9.buffer.find('\n', done);
+        if (end == std::string::npos) end = jt9.buffer.size();
+        size_t start = 0;
+        while (start < end) {
+            size_t nl = jt9.buffer.find('\n', start);
+            if (nl == std::string::npos || nl > end) nl = end;
+            std::string out = jt9.buffer.substr(start, nl - start);
+            start = nl + 1;
+            if (out.empty()) continue;
+            if (is_decode_line(out)) {
+                printf("%s\n", out.c_str());
+                ndecodes++;
+            } else if (out.find("<DecodeFinished>") == std::string::npos) {
+                fprintf(stderr, "%s\n", out.c_str());
+            }
+        }
+        jt9.buffer.erase(0, std::min(end + 1, jt9.buffer.size()));
+        if (done == std::string::npos)
+            fprintf(stderr, "Warning: jt9 did not finish decoding %s within %lld s\n", path.c_str(),
+                    (long long)(DECODE_TIMEOUT_MS / 1000));
+        printf("<FileDone> %s %d\n", path.c_str(), ndecodes);
+        fflush(stdout);
+        fflush(stderr);
+        if (ferror(stdout)) return 1;  // whoever reads us has gone
+
+        sharedMemory.lock();
+        dec_data->ipc[2] = 1;  // acknowledge, as WSJT-X does, so jt9 waits for the next period
+        sharedMemory.unlock();
+        // ...and wait for jt9 to take it (it sets ipc[2] back to 0) before the next file's ipc[2] = -1 can overwrite
+        // it: jt9 polls every few ms, and an acknowledgement it never saw would leave it waiting for ever.
+        const int64_t ack_deadline = getUtcMs() + 5000;
+        for (;;) {
+            sharedMemory.lock();
+            const bool taken = dec_data->ipc[2] != 1;
+            sharedMemory.unlock();
+            if (taken || !jt9.isRunning() || got_signal || getUtcMs() > ack_deadline) break;
+            jt9.waitFinished(10);
+        }
+    }
+    return got_signal ? 1 : 0;
+}
+
 int main(int argc, char *argv[]) {
     // Create unique application name for this instance (for shared memory key)
     const long pid = (long)getpid();
@@ -769,6 +877,7 @@ int main(int argc, char *argv[]) {
     int freq_high = 3000;        // High frequency Hz (matching WSJT-X typical range)
     std::string jt9_path;
     bool stream_mode = false;    // Stream PCM from stdin
+    bool feed_mode = false;      // Decode the WAV files named on stdin, one jt9 for all of them
     bool multithread = false;    // Multithreaded FT8 decoding
     std::string mode_str = "FT2";    // Default mode
     const ModeConfig *mode = &MODE_FT2;  // Default to FT2
@@ -797,6 +906,12 @@ int main(int argc, char *argv[]) {
             }
         } else if (arg == "-s") {
             stream_mode = true;
+        } else if (arg == "-F") {
+            feed_mode = true;
+        } else if (arg == "-L" && i + 1 < argc) {
+            freq_low = to_int(argv[++i]);
+        } else if (arg == "-H" && i + 1 < argc) {
+            freq_high = to_int(argv[++i]);
         } else if (arg == "-t" || arg == "--multithread") {
             multithread = true;
         } else if (arg == "--version") {
@@ -819,6 +934,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "  -d <depth>    Decoding depth 1-3 (default: 3)\n");
             fprintf(stderr, "  -s            Stream mode: read 12kHz 16-bit mono PCM from stdin\n");
             fprintf(stderr, "                Triggers decodes at cycle boundaries aligned to UTC\n");
+            fprintf(stderr, "  -F            File-feed mode: decode each WAV file named on stdin, one per line\n");
+            fprintf(stderr, "                (optionally followed by its UTC as HHMMSS), with one jt9 kept\n");
+            fprintf(stderr, "                running for all of them, so its hash table and a-priori calls\n");
+            fprintf(stderr, "                carry from period to period.  Each file's decodes are followed\n");
+            fprintf(stderr, "                by '<FileDone> PATH N' on stdout\n");
+            fprintf(stderr, "  -L <hz>       Lowest audio frequency decoded (default: 100)\n");
+            fprintf(stderr, "  -H <hz>       Highest audio frequency decoded (default: 3000)\n");
             fprintf(stderr, "  -t, --multithread  Enable multithreaded FT8 decoding (FT8 only)\n");
             fprintf(stderr, "                     Uses multiple CPU cores for faster decoding\n");
             fprintf(stderr, "  --version     Show version\n");
@@ -844,7 +966,12 @@ int main(int argc, char *argv[]) {
         i++;
     }
 
-    if (!stream_mode && wav_file.empty()) {
+    if (feed_mode && (stream_mode || !wav_file.empty())) {
+        fprintf(stderr, "Error: -F takes its WAV files on stdin, not with -s or a file argument\n");
+        usage_hint(argv[0]);
+        return 1;
+    }
+    if (!stream_mode && !feed_mode && wav_file.empty()) {
         fprintf(stderr, "Error: No WAV file specified (use -s for stream mode)\n");
         usage_hint(argv[0]);
         return 1;
@@ -1008,7 +1135,17 @@ int main(int argc, char *argv[]) {
 
     int result = 0;
 
-    if (stream_mode) {
+    if (feed_mode) {
+        result = run_feed(sharedMemory, dec_data, jt9, *mode);
+        fprintf(stderr, "Terminating jt9...\n");
+        sharedMemory.lock();
+        dec_data->ipc[1] = 999;
+        sharedMemory.unlock();
+        if (!jt9.waitFinished(2000)) {
+            jt9.killProcess();
+            jt9.waitFinished(-1);
+        }
+    } else if (stream_mode) {
         // Streaming mode: asynchronous event-driven processing (WSJT-X style)
         {
             StreamDecoder decoder(&sharedMemory, dec_data, &jt9, *mode);

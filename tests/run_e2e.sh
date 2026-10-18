@@ -197,6 +197,42 @@ diff_case jt9_not_executable -j ./not_executable_jt9 -m FT8 "$WAV"
 diff_case jt9_exits -j ./exits_immediately -m FT8 "$WAV"
 diff_case jt9_is_dir -j /tmp -m FT8 "$WAV"
 
+# ---- File-feed mode ------------------------------------------------------------
+# One jt9 for a sequence of WAV files named on stdin, as a station recording one file a period would feed it: each
+# file decoded at its own UTC (from its name, or given after it), '<FileDone> PATH N' after each, one jt9 throughout.
+echo "File-feed mode"
+mkdir -p feed
+cp "$WAV" feed/20261018T030745Z_14074000_linear.wav   # ka9q-radio pcmrecord's name: UTC 030745
+cp "$WAV" feed/261018_030800.wav                       # WSJT-X's name: UTC 030800
+cp "$WAV" feed/plain.wav                               # no UTC in its name: given on its line
+printf '%s\n' feed/20261018T030745Z_14074000_linear.wav feed/261018_030800.wav feed/missing.wav "feed/plain.wav 123456" |
+    timeout 120 "$BIN" -j "$JT9" -m FT8 -F >feed.out 2>feed.err
+echo $? >feed.rc
+[ "$(cat feed.rc)" = 0 ] && ok "feed: exit code 0" || bad "feed: exit code $(cat feed.rc)"
+if [ "$(grep '^<FileDone>' feed.out | awk '{print $2}' | tr '\n' ' ')" = "feed/20261018T030745Z_14074000_linear.wav feed/261018_030800.wav feed/missing.wav feed/plain.wav " ]; then
+    ok "feed: <FileDone> for each of the 4 files, in order"
+else
+    bad "feed: <FileDone> lines"; grep '^<FileDone>' feed.out
+fi
+grep -q '^<FileDone> feed/missing.wav 0$' feed.out && ok "feed: missing file reported with 0 decodes, and the run went on" || bad "feed: missing file"
+awk '/^<FileDone>/{exit} {print}' feed.out >feed.first
+expect_golden ft8_wav feed.first
+for t in 030745 030800 123456; do
+    n=$(grep -cE "^$t " feed.out)
+    [ "$n" -ge 10 ] && ok "feed: $n decodes timed $t" || bad "feed: decodes timed $t: $n"
+done
+[ "$(grep -cE '^[0-9]{6} ' feed.out)" = "$(grep -cE '^(030745|030800|123456) ' feed.out)" ] && ok "feed: no decode timed by the clock" || bad "feed: decodes timed by the clock"
+n_starts=$(grep -c '^Starting jt9 decoder' feed.err)
+[ "$n_starts" = 1 ] && ok "feed: one jt9 for all files" || bad "feed: jt9 started $n_starts times"
+check_clean feed
+printf '%s\n' "$WAV" | timeout 60 "$BIN" -j "$JT9" -m FT8 -F -L 1000 -H 1600 >feedlh.out 2>feedlh.err
+if awk '$5=="~"{if ($4 < 950 || $4 > 1650) bad=1; n++} END{exit !(n > 0 && !bad)}' feedlh.out; then
+    ok "feed -L 1000 -H 1600: $(grep -c '~' feedlh.out) decodes, all in 1000-1600 Hz"
+else
+    bad "feed -L/-H: decodes outside 1000-1600 Hz or none"; grep '~' feedlh.out | head -5
+fi
+check_clean feed_lh
+
 if [ "${QUICK:-}" = 1 ]; then
     echo; echo "$pass passed, $fail failed (stream tests skipped)"; [ $fail = 0 ]; exit
 fi

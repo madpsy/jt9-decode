@@ -106,6 +106,8 @@ needed to build or run `jt9_decode` itself.
   - Continuously processes audio
   - Triggers decodes at cycle boundaries aligned to UTC
   - Keeps jt9 running for efficiency
+- `-F` - File-feed mode: decode each WAV file named on stdin (see below)
+- `-L <hz>` / `-H <hz>` - Lowest / highest audio frequency decoded (default: 100 / 3000)
 - `-t, --multithread` - Enable multithreaded FT8 decoding (FT8 only)
   - Uses multiple CPU cores for faster decoding
   - Can decode more simultaneous signals
@@ -215,6 +217,25 @@ Stream with custom depth:
 ```bash
 rtl_fm -f 14.074M -s 12k | ./jt9_decode -j /usr/local/bin/jt9 -m FT8 -d 3 -s
 ```
+
+### File-Feed Mode
+
+For a recorder that writes one WAV file per period (ka9q-radio's `pcmrecord -8`/`-4`, for example), `-F` keeps one
+jt9 running and decodes each file whose path arrives on stdin, one per line, as soon as it arrives:
+
+```bash
+inotifywait -m -q -e moved_to --format '%w%f' /var/lib/ka9q-radio/ft8 |
+    ./jt9_decode -j /usr/local/bin/jt9 -m FT8 -d 2 -L 100 -H 4000 -F
+```
+
+- **One jt9 for every period**, as in WSJT-X: the state jt9 keeps from period to period (FT8's and FT4's callsign
+  hash table and a-priori calls) carries across files. A new jt9 per file forgets it, so hashed calls come out as
+  `<...>`. On 25 consecutive FT8 periods each of 40, 30 and 20 m, one jt9 decoded 5-8% more messages and left 80%
+  fewer `<...>` than a jt9 per file, for the same CPU.
+- **Each file is decoded at its own UTC**, not the clock's: from `HHMMSS` given after the path on its line, else from
+  the file name (`YYYYMMDDTHHMMSSZ_...` as pcmrecord writes, or `..._HHMMSS.wav` as WSJT-X does), else the clock.
+- **`<FileDone> PATH N`** follows each file's decodes on stdout (N decodes), so a caller feeding many files knows
+  where each one's end. A file that can't be read gets `<FileDone> PATH 0` and the run goes on.
 
 **How Streaming Mode Works:**
 - Continuously reads 12kHz, 16-bit signed, mono PCM from stdin
