@@ -770,6 +770,7 @@ int main(int argc, char *argv[]) {
     std::string jt9_path;
     bool stream_mode = false;    // Stream PCM from stdin
     bool multithread = false;    // Multithreaded FT8 decoding
+    bool fast_subtract = false;  // jt9 --fast-subtract (ubersdr_wsprd's jt9 only)
     std::string mode_str = "FT2";    // Default mode
     const ModeConfig *mode = &MODE_FT2;  // Default to FT2
 
@@ -799,6 +800,8 @@ int main(int argc, char *argv[]) {
             stream_mode = true;
         } else if (arg == "-t" || arg == "--multithread") {
             multithread = true;
+        } else if (arg == "--fast-subtract") {
+            fast_subtract = true;
         } else if (arg == "--version") {
             printf("jt9_decode %s\n", JT9_DECODE_VERSION);
             return 0;
@@ -821,6 +824,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "                Triggers decodes at cycle boundaries aligned to UTC\n");
             fprintf(stderr, "  -t, --multithread  Enable multithreaded FT8 decoding (FT8 only)\n");
             fprintf(stderr, "                     Uses multiple CPU cores for faster decoding\n");
+            fprintf(stderr, "  --fast-subtract  Pass --fast-subtract to jt9 (FT8/FT4/FT2; ubersdr_wsprd's jt9 only)\n");
             fprintf(stderr, "  --version     Show version\n");
             fprintf(stderr, "  --help        Show this help message\n");
             fprintf(stderr, "\n");
@@ -977,6 +981,7 @@ int main(int argc, char *argv[]) {
         "-a", ".",
         "-t", temp_dir.path,
     };
+    if (fast_subtract) args.push_back("--fast-subtract");
 
     // Verify jt9 binary exists
     struct stat jt9_stat;
@@ -1003,6 +1008,9 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "  Frequency range: %d - %d Hz\n", freq_low, freq_high);
     if (multithread && mode->mode_code == 8) {
         fprintf(stderr, "  Multithreaded: enabled (FT8)\n");
+    }
+    if (fast_subtract) {
+        fprintf(stderr, "  Fast subtract: enabled\n");
     }
     fflush(stderr);
 

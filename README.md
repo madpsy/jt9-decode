@@ -110,6 +110,9 @@ needed to build or run `jt9_decode` itself.
   - Uses multiple CPU cores for faster decoding
   - Can decode more simultaneous signals
   - Provides better performance on busy bands
+- `--fast-subtract` - Pass `--fast-subtract` to jt9 (FT8, FT4 and FT2)
+  - Needs the jt9 from [ubersdr_wsprd](https://github.com/madpsy/ubersdr_wsprd); WSJT-X's jt9 rejects it
+  - Same decodes as WSJT-X for less CPU
 - `--version` - Show version
 - `--help` - Show help message
 
